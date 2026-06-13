@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# RBLA 래퍼 — train.sh (option b) 에서 폴드별로 호출.
+#
+# Usage: bash tools/train_rbla.sh <fold_index> <out_dir>
+#
+# Env vars:
+#   SEED       시드 (default 42)
+#   EPOCHS     에포크 수 (default 10)
+#   BS         배치 크기 (default 20)
+#   RBLA_MODE  standard | episode  (default standard)
+#              standard : run_rbla.py 를 통해 torchvision.ImageFolder 사용
+#                         (다른 모델과 동일한 데이터 파이프라인)
+#              episode  : /train.py 직접 호출, CSV+npy 에피소드 데이터 사용
+
+# set -e 대신 명시적 오류 처리 — 중첩 if/then/fi 안에서 set -e가 오류를
+# 무시하는 bash 버그를 피하기 위해 die() 사용
+die() { echo "[train_rbla] ERROR: $*" >&2; exit 1; }
+
+FOLD="${1:-}"
+OUT="${2:-}"
+[ -n "$FOLD" ] || die "fold index 인자가 없습니다. Usage: bash tools/train_rbla.sh <fold_index> <out_dir>"
+[ -n "$OUT"  ] || die "out_dir 인자가 없습니다."
+
+HERE="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" || die "스크립트 경로 확인 실패"
+ROOT="$( cd "$HERE/.." && pwd )"                          || die "ROOT 경로 확인 실패"
+RBLA_DIR="$ROOT/models/RBLA"
+
+SEED="${SEED:-42}"
+EPOCHS="${EPOCHS:-100}"
+BS="${BS:-64}"
+PATIENCE="${PATIENCE:-40}"
+BASE="${BASE:-0}"          # 1이면 --base (LENet_base, BPR 없음)
+ADV="${ADV:-0}"            # 다른 모델과 동일하게 adversarial 기본 off
+export BPR_AUX="${BPR_AUX:-0}"        # 1이면 aux bottleneck (query_dim→bn_dim) 추가
+export BPR_BN_DIM="${BPR_BN_DIM:-128}" # aux bottleneck 차원
+export BPR_LAMBDA="${BPR_LAMBDA:-0.3}"  # BPR loss 가중치
+export BPR_WARMUP="${BPR_WARMUP:-5}"    # MedViT 방식: 첫 N epoch CE-only
+RBLA_MODE="${RBLA_MODE:-standard}"
+
+echo "[train_rbla] ============================================"
+echo "[train_rbla] mode=$RBLA_MODE  fold=$FOLD  seed=$SEED  epochs=$EPOCHS  bs=$BS"
+echo "[train_rbla] ROOT=$ROOT"
+echo "[train_rbla] RBLA_DIR=$RBLA_DIR"
+echo "[train_rbla] OUT=$OUT"
+
+# RBLA 디렉토리 존재 확인
+[ -d "$RBLA_DIR" ] || die "RBLA 디렉토리 없음: $RBLA_DIR"
+
+mkdir -p "$OUT" || die "출력 디렉토리 생성 실패: $OUT"
+OUT_ABS="$(cd "$OUT" && pwd)" || die "OUT 절대경로 변환 실패: $OUT"
+echo "[train_rbla] output → $OUT_ABS"
+
+if [ "$RBLA_MODE" = "standard" ]; then
+    # ── Standard 모드: run_rbla.py 를 통해 imagefolder 사용 ─────────────────
+    RUNNER="$HERE/run_rbla.py"
+    [ -f "$RUNNER" ] || die "run_rbla.py 없음: $RUNNER"
+
+    FOLD_DATA="$ROOT/${DATA_ROOT:-data}/5fold/fold_${FOLD}/imagefolder"
+    [ -d "$FOLD_DATA/train" ] || die "train 폴더 없음: $FOLD_DATA/train"
+    [ -d "$FOLD_DATA/val"   ] || die "val 폴더 없음: $FOLD_DATA/val"
+
+    TRAIN_ABS="$(cd "$FOLD_DATA/train" && pwd)" || die "train 경로 실패"
+    VAL_ABS="$(  cd "$FOLD_DATA/val"   && pwd)" || die "val 경로 실패"
+    if [ -d "$FOLD_DATA/test" ]; then
+        TEST_OPT="--test-path $(cd "$FOLD_DATA/test" && pwd)"
+    else
+        TEST_OPT=""
+        echo "[train_rbla] test 폴더 없음 — val 로 대체"
+    fi
+
+    echo "[train_rbla] standard: train=$TRAIN_ABS"
+    python3 "$RUNNER" \
+        --train-path "$TRAIN_ABS" \
+        --val-path   "$VAL_ABS" \
+        $TEST_OPT \
+        --output-dir "$OUT_ABS" \
+        --seed       "$SEED" \
+        --epochs     "$EPOCHS" \
+        --patience   "$PATIENCE" \
+        ${BASE:+--base} \
+        $( [ "$ADV" = "0" ] && echo "--no-adv" ) \
+        --batch-size "$BS" \
+        --fold-index "$FOLD" \
+        || die "run_rbla.py 실패 (fold=$FOLD)"
+
+else
+    # ── Episode 모드: RBLA 자체 CSV + npy 인덱스 ────────────────────────────
+    [ -f "$RBLA_DIR/train.py" ] || die "train.py 없음: $RBLA_DIR/train.py"
+
+    echo "[train_rbla] episode: RBLA 자체 CSV+npy 사용"
+    cd "$RBLA_DIR" || die "cd 실패: $RBLA_DIR"
+
+    python3 train.py \
+        --seed "$SEED" \
+        --epochs "$EPOCHS" \
+        --batch_size "$BS" \
+        --k_fold_index "$FOLD" \
+        --mode episode \
+        --checkpoints "$OUT_ABS/checkpoints" \
+        --log_dir "$OUT_ABS/logs" \
+        --proposed \
+        || die "python3 train.py 실패 (fold=$FOLD, mode=episode)"
+fi
+
+echo "[train_rbla] fold $FOLD 완료 — ckpt: $OUT_ABS/checkpoints/"

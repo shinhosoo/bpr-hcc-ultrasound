@@ -1,0 +1,106 @@
+"""RBLA base(LENet_base) 에 BPR(latent) 을 monkey-patch 로 주입하는 runner.
+
+RBLA 원본 코드는 건드리지 않는다. train.py 가 model_name=='hsq' 일 때 부르는
+train_one_epoch_base 를 utils.train_eval 차원에서 교체한 뒤, 표준 run_rbla.py 를
+그대로 실행(runpy)해 인자 구성·학습·예측 저장을 전부 재사용한다.
+
+BPR latent: LENet_base.forward 의 self.head 직전 표현(head_norm 출력, (B,tokens,dim))을
+forward_pre_hook 으로 잡아 토큰 평균 → (B, query_dim) 에 prototype BPR.
+
+env: BPR_LAMBDA(0.3)  BPR_WARMUP(5)  BPR_PROTO(geomedian)  BPR_NUM_CLASSES(2)
+"""
+import os, sys, math, runpy
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+RBLA_DIR = os.path.join(ROOT, "models", "RBLA")
+sys.path.insert(0, RBLA_DIR)                       # utils.train_eval
+sys.path.insert(0, os.path.join(ROOT, "tools", "bpr"))  # bpr_loss
+os.chdir(RBLA_DIR)
+
+import torch
+from bpr_loss import total_bpr_loss
+import utils.train_eval as TE
+from tqdm import tqdm
+
+BPR_LAMBDA = float(os.environ.get("BPR_LAMBDA", "0.3"))
+BPR_WARMUP = int(os.environ.get("BPR_WARMUP", "5"))
+BPR_PROTO = os.environ.get("BPR_PROTO", "geomedian")
+BPR_NUM_CLASSES = int(os.environ.get("BPR_NUM_CLASSES", "2"))
+
+_lat = {}
+_hook = {"done": False}
+
+def _register_latent_hook(model):
+    if _hook["done"]:
+        return
+    m = model.module if hasattr(model, "module") else model
+    head = getattr(m, "head", None)
+    if head is None:
+        print("[rbla-bpr] WARN: model.head 없음 — BPR 비활성")
+        _hook["done"] = True
+        return
+    def _pre(_mod, _inp):
+        f = _inp[0]
+        if f.dim() == 3:            # (B, tokens, dim) → 토큰 평균
+            f = f.mean(dim=1)
+        _lat["z"] = f
+    head.register_forward_pre_hook(_pre)
+    _hook["done"] = True
+    print(f"[rbla-bpr] latent hook on model.head  (lambda={BPR_LAMBDA}, warmup={BPR_WARMUP}, proto={BPR_PROTO})")
+
+
+def _bpr_train_one_epoch_base(model, optimizer, metric_collection=None, data_loader=None,
+                              device=0, num_updates=0, epoch=0, criterion_focal=None,
+                              scheduler=None, criterion=None, mixup_fn=None, scaler=None,
+                              aux_loss=None, model_ema=None, ema_updata_epoch=None):
+    # === 원본 train_one_epoch_base 본문 + latent BPR 주입 ===
+    _register_latent_hook(model)
+    metric_collection.reset()
+    model.train()
+    total_loss = 0.
+    data_loader = tqdm(data_loader, desc=' train')
+    for step, (img, labels, img_path) in enumerate(data_loader):
+        target = labels
+        img = img.to(device)
+        labels = labels.to(device)
+        if mixup_fn is not None:
+            img, labels = mixup_fn(img, labels)
+        _use_amp = (scaler is not None)
+        with torch.cuda.amp.autocast(enabled=_use_amp):
+            output = model(img)
+            if aux_loss:
+                loss = criterion(output, labels) + criterion_focal(output, labels, target)
+            else:
+                loss = criterion(output, labels)
+            # === BPR (latent) ===
+            _z = _lat.get("z")
+            if BPR_LAMBDA > 0 and epoch >= BPR_WARMUP and _z is not None and _z.size(0) == target.size(0):
+                _bpr = total_bpr_loss(_z.float(), target.to(_z.device),
+                                      num_classes=BPR_NUM_CLASSES, use_adversarial=False,
+                                      prototype=BPR_PROTO)
+                if torch.is_tensor(_bpr) and torch.isfinite(_bpr):
+                    loss = loss + BPR_LAMBDA * _bpr
+        if not math.isfinite(loss.item()):
+            optimizer.zero_grad()
+            continue
+        optimizer.zero_grad()
+        if _use_amp:
+            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+        else:
+            loss.backward(); optimizer.step()
+        with torch.no_grad():
+            total_loss = total_loss + loss.item()
+            data_loader.set_description('loss:{:.6f}'.format(loss.item()))
+            pred = torch.softmax(output, 1)
+            metric_collection.update(pred[:, 1].detach().cpu(), target.detach().cpu())
+        scheduler.step()
+    return total_loss
+
+
+# === train 임포트 전에 패치 — train.py 의 'from utils.train_eval import train_one_epoch_base' 가 이걸 집음 ===
+TE.train_one_epoch_base = _bpr_train_one_epoch_base
+print(f"[rbla-bpr] train_one_epoch_base monkey-patched (latent BPR, lambda={BPR_LAMBDA})")
+
+# === 표준 runner 를 그대로 실행 (인자 구성 + train.main + 예측 저장 재사용) ===
+runpy.run_path(os.path.join(HERE, "run_rbla.py"), run_name="__main__")

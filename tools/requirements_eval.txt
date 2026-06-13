@@ -1,0 +1,6 @@
+# Required only for unified evaluation & visualization (the models themselves
+# may have their own torch/timm requirements installed separately).
+numpy>=1.20
+scikit-learn>=1.0
+matplotlib>=3.4
+pyyaml>=5.4

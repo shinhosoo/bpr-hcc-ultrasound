@@ -1,0 +1,819 @@
+"""DiffMICv2 1-stage end-to-end BPR — Lightning training_step 에 BPR loss 합산.
+원본 코드 무수정. AttentionModule.forward 또는 ConditionalModel.forward,
+CoolSystem.training_step, CoolSystem.configure_optimizers 를 monkey-patch.
+
+추가 옵션 (env var):
+  BPR_HOOK     = attn | prelin4 | enc512 | enc512_local | xweight
+      - attn   (기본) : DCG.AttentionModule.z (B, 512) 캡쳐
+                        — DCG 가 frozen 이면 표현학습 신호가 DCG 까지 안 흐름
+                        (DCG_UNFREEZE 와 함께 써야 backbone 까지 학습)
+      - prelin4       : ConditionalModel 의 lin4 직전 feature 캡쳐
+                        — (B, feature_dim, np, np) → spatial mean → (B, feature_dim=6144)
+                        — diffusion 본체 (trainable) 가 BPR signal 로 학습됨
+                        — timestep 의존적 (BPR_T_MAX 의 의미 있음)
+      - enc512        : ConditionalModel.encoder_x (global) 의 ResNet18 backbone 직후 512-d
+                        — (B, 512), Linear(512→6144) 직전. trainable backbone.
+                        — image-only, **timestep 무관** (BPR_T_MAX 무의미)
+      - enc512_local  : ConditionalModel.encoder_x_l (local crops) 의 ResNet18 직후 512-d,
+                        K=6 crop 평균 → (B, 512). image-only, timestep 무관.
+      - xweight       : ConditionalModel 의 fused conditioning vector 캡쳐
+                        — (B, 6144), global + local + cond_weight fusion 결과
+                        — encoder_x, encoder_x_l, cond_weight 셋 다 trainable
+                        — image-only, timestep 무관, 라벨 stream 진입 전.
+      - xweight_bn    : xweight 위치에 in-path bottleneck 삽입
+                        — Linear(6144→BN_DIM) → ReLU → Linear(BN_DIM→6144)
+                        — 중간 (B, BN_DIM) 캡쳐 → BPR 표현학습 대상
+                        — 분류가 그 압축점에 의존하므로 표현학습 신호가 강력
+                        — BN_SKIP=1 이면 residual (x_weight + bn(x_weight))
+      - xweight_aux   : 병렬 보조 bottleneck branch (additive, by design)
+                        — 원본 x_weight (B, 6144) 은 그대로 유지
+                        — 보조 branch: aux_down(6144→BN_DIM) → ReLU → aux_up(BN_DIM→6144)
+                        — 중간 (B, BN_DIM) 캡쳐 → BPR 표현학습 대상
+                        — 보조 출력을 x_weight 에 ADD (병렬 residual)
+                        — aux_up 의 weight/bias ZERO INIT → 시작 시점에 보조 출력 = 0
+                        → 학습 초기엔 baseline 과 완전 동일, BPR 가 bottleneck 을 점진적 학습
+                        — 가장 안전한 representation learning 설계
+      - dual_gl       : 글로벌 (encoder_x) + 로컬 (encoder_x_l mean) 두 표현을 각각 독립 BPR
+                        — 각 branch (B, 512), 별도 projection head + 별도 prototype buffer
+                        — 두 BPR loss 평균이 최종 BPR loss
+                        — DCG 의 dual-granularity 철학과 정렬됨
+  BPR_BN_DIM   = int (기본 512) — xweight_bn / xweight_aux 의 bottleneck 중간 차원
+  BPR_BN_SKIP  = 0 | 1 (기본 0) — xweight_bn 만 적용: 0: pure / 1: residual
+  BPR_T_MAX           = float (0, 1] 기본 1.0
+      이미지별 평균 diffusion timestep 이 T*BPR_T_MAX 미만일 때만 BPR loss 합산.
+      prelin4 처럼 feature 가 timestep 에 의존할 때, 노이즈가 덜한 step 에서만 학습 가능.
+      예) 0.3 → 평균 t 가 하위 30% 인 샘플만 BPR 에 참여.
+  BPR_WARMUP_EPOCHS   = int   기본 0
+      첫 N epoch 동안은 BPR loss 비활성 (diffusion 만 학습) → 본체 안정화 후 BPR 가세.
+  BPR_MIN_ACTIVE      = int   기본 2
+      게이트 통과 샘플이 이 값 미만이면 그 step 의 BPR skip.
+  BPR_STAGE           = 1 | 2 (기본 1)
+      1 = joint training (diffusion + BPR 동시 학습)
+      2 = post-hoc refinement — stage1 ckpt 로드 후 diffusion 가중치 ↓ + BPR 만 학습
+  BPR_STAGE2_CKPT     = str (BPR_STAGE=2 일 때 필수)
+      stage1 baseline ckpt 경로. shell 스크립트가 BPR_STAGE2_FROM 으로 자동 탐색.
+  BPR_STAGE2_DIFF_W   = float (기본 0.0)
+      stage2 의 diffusion loss 가중치. 0 = 순수 BPR refinement, 0.1 = 가벼운 regularization.
+  BPR_STAGE2_LR_SCALE = float (기본 0.1)
+      stage2 의 main LR 배수 (작게 시작).
+  DCG_UNFREEZE = 0 | attn | local | all
+      - 0    : 기본. DCG (aux_model) frozen 유지 (원본 동작).
+      - attn : attention_module + mil_attn + classifier_linear 만 unfreeze
+      - local: local_network + 위 항목들까지 unfreeze
+      - all  : DCG 전체 unfreeze
+  DCG_LR_SCALE = float (기본 0.1) — main LR 대비 DCG 파라미터 LR 배수
+  DCG_WARMUP   = int   (기본 0)   — 첫 N epoch 동안은 frozen, 그 후 unfreeze
+"""
+import os, sys, argparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(ROOT, "models/DiffMICv2-main"))
+
+import torch
+import torch.nn.functional as F
+from bpr_loss import bpr_prototype_loss, total_bpr_loss
+
+BPR_LAMBDA = float(os.environ.get("BPR_LAMBDA", "0.1"))
+BPR_ADV = os.environ.get("BPR_ADV", "0") == "1"
+NUM_CLASSES = int(os.environ.get("BPR_NUM_CLASSES", "2"))
+BPR_PROTO = os.environ.get("BPR_PROTO", "mean")   # mean | geomedian | sinkhorn
+BPR_MODE = os.environ.get("BPR_MODE", "joint")   # joint | mgda | pcgrad
+BPR_PROTO_SCOPE = os.environ.get("BPR_PROTO_SCOPE", "batch")   # batch | global
+BPR_BUFFER_SIZE = int(os.environ.get("BPR_BUFFER_SIZE", "512"))
+from mgda import mgda_step
+from pcgrad import pcgrad_step
+from bpr_loss import geometric_median, sinkhorn_centroid
+BPR_PROJ_DIM = int(os.environ.get("BPR_PROJ_DIM", "128"))
+BPR_PROJ_HIDDEN = int(os.environ.get("BPR_PROJ_HIDDEN", "512"))
+
+# === DCG (aux_model) 선택적 unfreeze 옵션 ===
+DCG_UNFREEZE = os.environ.get("DCG_UNFREEZE", "0")          # 0 | attn | local | all
+DCG_LR_SCALE = float(os.environ.get("DCG_LR_SCALE", "0.1"))
+DCG_WARMUP   = int(os.environ.get("DCG_WARMUP", "0"))       # 첫 N epoch 동안은 frozen 유지
+
+# === BPR hook 위치 선택 ===
+BPR_HOOK = os.environ.get("BPR_HOOK", "attn")               # attn | prelin4 | enc512 | enc512_local | xweight | xweight_bn | xweight_aux | dual_gl
+
+# xweight_bn / xweight_aux 공통 옵션
+BPR_BN_DIM  = int(os.environ.get("BPR_BN_DIM", "512"))        # bottleneck 중간 차원
+BPR_BN_SKIP = os.environ.get("BPR_BN_SKIP", "0") == "1"       # residual skip 여부 (xweight_bn 전용)
+BPR_AUX_DETACH = os.environ.get("BPR_AUX_DETACH", "0") == "1"  # xweight_aux: aux_down 입력에서 x_weight detach (BPR 이 메인 conditioning 을 안 끌어당김)
+
+# local 표현 pooling 방식 — dual_gl / enc512_local 에 영향
+#   mean     (기본): K=6 crop 평균 → (B, 512) 한 벡터 per image
+#   parallel       : K=6 crop 각각을 독립 BPR sample → (B*6, 512), label 도 repeat_interleave
+BPR_LOCAL_POOL = os.environ.get("BPR_LOCAL_POOL", "mean")
+
+# === BPR 활성 시점 게이트 ===
+BPR_T_MAX           = float(os.environ.get("BPR_T_MAX", "1.0"))         # (0, 1] — 이미지별 평균 timestep 의 fraction. avg_t/T < BPR_T_MAX 인 샘플만 BPR 에 참여
+BPR_WARMUP_EPOCHS   = int(os.environ.get("BPR_WARMUP_EPOCHS", "0"))     # 첫 N epoch 동안은 BPR 비활성 (diffusion 만 학습)
+BPR_MIN_ACTIVE      = int(os.environ.get("BPR_MIN_ACTIVE", "2"))        # 게이트 통과 샘플 수 < 이 값이면 BPR skip
+
+# === Stage (1=joint / 2=post-hoc refinement) ===
+BPR_STAGE             = int(os.environ.get("BPR_STAGE", "1"))           # 1 (joint) | 2 (post-hoc)
+BPR_STAGE2_CKPT       = os.environ.get("BPR_STAGE2_CKPT", "")           # stage1 ckpt 경로 (필수 if STAGE=2)
+BPR_STAGE2_DIFF_W     = float(os.environ.get("BPR_STAGE2_DIFF_W", "0.0"))   # stage2 diffusion loss 가중치
+BPR_STAGE2_LR_SCALE   = float(os.environ.get("BPR_STAGE2_LR_SCALE", "0.1")) # stage2 main LR 배수
+
+# === MedViT-style 2-phase (한 run 안에서 자동 phase 전환) =====================
+# Phase 1 (epoch 0 ~ STAGE1_EPOCHS-1): 평소대로 (diffusion + BPR joint, BPR_WARMUP_EPOCHS 적용)
+# Phase 2 (epoch STAGE1_EPOCHS ~ end): 모든 conv/diffusion freeze, aux_model.fusion_dnn 만 fine-tune,
+#                                       BPR 비활성, LR ×0.1
+# 옵션 B 매핑 — MedViT 의 backbone-freeze + proj_head-only fine-tune 과 동일 구조.
+BPR_TWO_PHASE         = os.environ.get("BPR_TWO_PHASE", "0") == "1"
+BPR_PHASE1_EPOCHS     = int(os.environ.get("BPR_PHASE1_EPOCHS", "-1"))   # -1 = 전체의 절반
+BPR_PHASE2_LR_SCALE   = float(os.environ.get("BPR_PHASE2_LR_SCALE", "0.1"))
+_phase_state = {"frozen": False, "phase1_done_at": -1}
+
+# Per-branch, per-class rolling buffer (global proto 근사)
+# _buffer[branch] = {"cls": {c: [tensors]}, "cap": N}
+_buffer = {}
+def _ensure_buffer(branch):
+    if branch not in _buffer:
+        _buffer[branch] = {"cls": {c: [] for c in range(NUM_CLASSES)}, "cap": BPR_BUFFER_SIZE}
+    return _buffer[branch]
+
+def _update_buffer(branch, zp, labels):
+    if BPR_PROTO_SCOPE != "global":
+        return
+    buf = _ensure_buffer(branch)
+    for c in range(NUM_CLASSES):
+        m = (labels == c)
+        if m.any():
+            buf["cls"][c].append(zp[m].detach().cpu())
+            n = sum(t.size(0) for t in buf["cls"][c])
+            while n > buf["cap"] and len(buf["cls"][c]) > 1:
+                drop = buf["cls"][c].pop(0)
+                n -= drop.size(0)
+
+def _buffer_prototypes(branch, device):
+    if BPR_PROTO_SCOPE != "global" or branch not in _buffer:
+        return None
+    buf = _buffer[branch]
+    protos = []
+    for c in range(NUM_CLASSES):
+        if not buf["cls"][c]:
+            return None
+        X = torch.cat(buf["cls"][c], dim=0).to(device)
+        if X.size(0) < 8:
+            return None
+        if BPR_PROTO == "geomedian": p = geometric_median(X)
+        elif BPR_PROTO == "sinkhorn": p = sinkhorn_centroid(X)
+        else: p = X.mean(0)
+        p = torch.nn.functional.normalize(p, dim=-1)
+        protos.append(p)
+    return torch.stack(protos, dim=0)
+
+import torch.nn as nn
+# Per-branch projection heads — branch 별로 (B, D) → (B, BPR_PROJ_DIM) 학습
+_proj = {}  # branch -> {"head": nn.Sequential, "opt": torch.optim.Adam}
+def _ensure_projection(branch, feat_dim, device):
+    if branch not in _proj:
+        head = nn.Sequential(
+            nn.Linear(feat_dim, BPR_PROJ_HIDDEN), nn.ReLU(inplace=False),
+            nn.Linear(BPR_PROJ_HIDDEN, BPR_PROJ_DIM),
+        ).to(device)
+        _proj[branch] = {
+            "head": head,
+            "opt":  torch.optim.Adam(head.parameters(), lr=1e-3),
+        }
+    return _proj[branch]["head"], _proj[branch]["opt"]
+
+# (1) BPR hook 위치 — BPR_HOOK 에 따라 분기
+# _state 는 키별로 표현 텐서 보관. 단일 hook 은 "z", dual_gl 은 "zg"/"zl" 사용.
+_state = {"z": None, "zg": None, "zl": None}
+
+if BPR_HOOK == "attn":
+    # DCG 의 AttentionModule.forward 출력 (B, 512) 캡쳐
+    import pretraining.modules as M
+    _orig_am = M.AttentionModule.forward
+    def _am_patched(self, h_crops):
+        z, attn, y = _orig_am(self, h_crops)
+        _state["z"] = z
+        return z, attn, y
+    M.AttentionModule.forward = _am_patched
+    print(f"[bpr-hook] attn  — DCG.AttentionModule.z capture")
+
+elif BPR_HOOK == "prelin4":
+    # ConditionalModel 의 lin4 직전 feature 캡쳐 (diffusion backbone trainable)
+    import model as MDL
+    _orig_cm_fwd = MDL.ConditionalModel.forward
+    def _cm_fwd_patched(self, x, y, t, x_l, attn):
+        bz, np_, I, J = x_l.shape
+
+        x_l_in = x_l.view(bz * np_, I, J).unsqueeze(1).expand(-1, 3, -1, -1)
+        x_l_in = self.encoder_x_l(x_l_in)
+        x_l_in = self.norm_l(x_l_in)
+
+        x_g = self.encoder_x(x)
+        x_g = self.norm(x_g)
+
+        y2 = self.lin1(y, t)
+        y2 = self.unetnorm1(y2)
+        y2 = F.softplus(y2)
+
+        x_l_in = x_l_in.reshape(bz, np_, x_l_in.shape[1]).permute(0, 2, 1)
+        x_cat = torch.cat([x_g.unsqueeze(-1), x_l_in], dim=-1)
+        w = torch.softmax(self.cond_weight, dim=2)
+        x_weight = torch.sum(x_cat * w, dim=-1)
+        y2 = x_weight.unsqueeze(-1).unsqueeze(-1) * y2
+
+        y2 = self.lin2(y2, t); y2 = self.unetnorm2(y2); y2 = F.softplus(y2)
+        y2 = self.lin3(y2, t); y2 = self.unetnorm3(y2); y2 = F.softplus(y2)
+
+        # ★ lin4 직전 feature 캡쳐: (B, feature_dim, np, np) → spatial mean → (B, feature_dim)
+        # training_step 호출에서만 의미. validation/inference 에서는 _state 사용 안 함.
+        _state["z"] = y2.mean(dim=(-2, -1))
+
+        return self.lin4(y2)
+    MDL.ConditionalModel.forward = _cm_fwd_patched
+    print(f"[bpr-hook] prelin4 — ConditionalModel pre-lin4 feature (spatial-mean) capture")
+
+elif BPR_HOOK == "dual_gl":
+    # 글로벌 (encoder_x) + 로컬 (encoder_x_l, K=6 평균) 두 표현을 각각 캡쳐.
+    # 각각 별도 projection head + 별도 prototype buffer 로 독립 BPR loss.
+    # 두 loss 의 평균이 최종 BPR loss → MGDA/PCGrad 와 자유롭게 조합.
+    import model as MDL
+    _orig_cm_fwd = MDL.ConditionalModel.forward
+    def _cm_fwd_patched(self, x, y, t, x_l, attn):
+        bz, np_, I, J = x_l.shape
+
+        # local: ResNet18 .f → flatten → (B*K, 512)
+        x_l_in = x_l.view(bz * np_, I, J).unsqueeze(1).expand(-1, 3, -1, -1)
+        x_l_512_raw = self.encoder_x_l.f(x_l_in)
+        x_l_512 = torch.flatten(x_l_512_raw, start_dim=1)         # (B*K, 512)
+        x_l_feat = self.encoder_x_l.g(x_l_512)                    # (B*K, 6144)
+        x_l_feat = self.norm_l(x_l_feat)
+
+        # global: ResNet18 .f → flatten → (B, 512)
+        x_512_raw = self.encoder_x.f(x)
+        x_512 = torch.flatten(x_512_raw, start_dim=1)             # (B, 512)
+        x_g_feat = self.encoder_x.g(x_512)
+        x_g_feat = self.norm(x_g_feat)
+
+        # ★ DUAL capture
+        _state["zg"] = x_512                                       # global (B, 512)
+        if BPR_LOCAL_POOL == "parallel":
+            _state["zl"] = x_l_512                                 # parallel: (B*K, 512) — 각 crop 독립
+        else:  # mean (기본)
+            _state["zl"] = x_l_512.view(bz, np_, -1).mean(dim=1)   # local pooled (B, 512)
+
+        # 나머지 원본 forward
+        x_l_feat = x_l_feat.reshape(bz, np_, x_l_feat.shape[1]).permute(0, 2, 1)
+        x_cat = torch.cat([x_g_feat.unsqueeze(-1), x_l_feat], dim=-1)
+        w = torch.softmax(self.cond_weight, dim=2)
+        x_weight = torch.sum(x_cat * w, dim=-1)
+
+        y2 = self.lin1(y, t); y2 = self.unetnorm1(y2); y2 = F.softplus(y2)
+        y2 = x_weight.unsqueeze(-1).unsqueeze(-1) * y2
+        y2 = self.lin2(y2, t); y2 = self.unetnorm2(y2); y2 = F.softplus(y2)
+        y2 = self.lin3(y2, t); y2 = self.unetnorm3(y2); y2 = F.softplus(y2)
+        return self.lin4(y2)
+    MDL.ConditionalModel.forward = _cm_fwd_patched
+    print(f"[bpr-hook] dual_gl — global encoder_x + local encoder_x_l (K=6 mean) dual capture, each (B, 512)")
+
+elif BPR_HOOK == "xweight_aux":
+    # 병렬 보조 bottleneck branch — 원본 x_weight 는 그대로 유지하면서
+    # 보조 branch (aux_down → BN_DIM → ReLU → aux_up) 의 출력을 x_weight 에 ADD.
+    # aux_up 는 ZERO INIT → 학습 시작 시점에 보조 출력 = 0 → baseline 과 동일 동작.
+    # BPR 가 점진적으로 bottleneck 중간을 클래스 분리 가능하게 다듬어 감.
+    import model as MDL
+    _orig_cm_init = MDL.ConditionalModel.__init__
+    def _cm_init_with_aux(self, *args, **kwargs):
+        _orig_cm_init(self, *args, **kwargs)
+        feat_dim = self.encoder_x.g.out_features  # 6144
+        self.aux_down = nn.Linear(feat_dim, BPR_BN_DIM)
+        self.aux_relu = nn.ReLU(inplace=False)
+        self.aux_up   = nn.Linear(BPR_BN_DIM, feat_dim)
+        # ★ aux_up zero-init → 시작 시 aux 출력 = 0 → x_weight unchanged
+        nn.init.zeros_(self.aux_up.weight)
+        nn.init.zeros_(self.aux_up.bias)
+        print(f"[bpr-hook] xweight_aux — added parallel bottleneck {feat_dim} → {BPR_BN_DIM} → {feat_dim} (aux_up zero-init)")
+    MDL.ConditionalModel.__init__ = _cm_init_with_aux
+
+    _orig_cm_fwd = MDL.ConditionalModel.forward
+    def _cm_fwd_patched(self, x, y, t, x_l, attn):
+        bz, np_, I, J = x_l.shape
+
+        x_l_in = x_l.view(bz * np_, I, J).unsqueeze(1).expand(-1, 3, -1, -1)
+        x_l_feat = self.encoder_x_l(x_l_in)
+        x_l_feat = self.norm_l(x_l_feat)
+
+        x_g = self.encoder_x(x)
+        x_g = self.norm(x_g)
+
+        x_l_feat = x_l_feat.reshape(bz, np_, x_l_feat.shape[1]).permute(0, 2, 1)
+        x_cat = torch.cat([x_g.unsqueeze(-1), x_l_feat], dim=-1)
+        w = torch.softmax(self.cond_weight, dim=2)
+        x_weight = torch.sum(x_cat * w, dim=-1)                            # (B, 6144) 원본
+
+        # ★ 병렬 보조 branch — bottleneck 으로 (B, BN_DIM) 만들고 BPR 표현학습
+        # BPR_AUX_DETACH=1 → 메인 x_weight 는 BPR gradient 로부터 보호되고
+        # 보조 가지(aux_down/up)만 BPR 로 형성됨. forward 값은 동일(detach 는 grad 만 차단).
+        _aux_src = x_weight.detach() if BPR_AUX_DETACH else x_weight
+        x_aux_mid = self.aux_down(_aux_src)                                # (B, BN_DIM=512)
+        _state["z"] = x_aux_mid                                            # ★ BPR 캡쳐
+        x_aux_out = self.aux_up(self.aux_relu(x_aux_mid))                  # (B, 6144) — 초기 ≈ 0
+        x_weight = x_weight + x_aux_out                                    # 원본 + 보조 (병렬 residual)
+
+        # 나머지 원본 forward
+        y2 = self.lin1(y, t); y2 = self.unetnorm1(y2); y2 = F.softplus(y2)
+        y2 = x_weight.unsqueeze(-1).unsqueeze(-1) * y2
+        y2 = self.lin2(y2, t); y2 = self.unetnorm2(y2); y2 = F.softplus(y2)
+        y2 = self.lin3(y2, t); y2 = self.unetnorm3(y2); y2 = F.softplus(y2)
+        return self.lin4(y2)
+    MDL.ConditionalModel.forward = _cm_fwd_patched
+    print(f"[bpr-hook] xweight_aux — parallel auxiliary bottleneck (B, {BPR_BN_DIM}) capture, zero-init residual")
+
+elif BPR_HOOK == "xweight_bn":
+    # xweight 위치에 in-path bottleneck 삽입.
+    # ConditionalModel.__init__ patch 로 bn_down/bn_relu/bn_up 모듈 등록 →
+    #  self.model.parameters() 에 자동 포함되어 main optimizer 가 학습.
+    import model as MDL
+    _orig_cm_init = MDL.ConditionalModel.__init__
+    def _cm_init_with_bn(self, *args, **kwargs):
+        _orig_cm_init(self, *args, **kwargs)
+        feat_dim = self.encoder_x.g.out_features  # 6144
+        self.bn_down = nn.Linear(feat_dim, BPR_BN_DIM)
+        self.bn_relu = nn.ReLU(inplace=False)
+        self.bn_up   = nn.Linear(BPR_BN_DIM, feat_dim)
+        print(f"[bpr-hook] xweight_bn — added bottleneck {feat_dim} → {BPR_BN_DIM} → {feat_dim}  (skip={BPR_BN_SKIP})")
+    MDL.ConditionalModel.__init__ = _cm_init_with_bn
+
+    _orig_cm_fwd = MDL.ConditionalModel.forward
+    def _cm_fwd_patched(self, x, y, t, x_l, attn):
+        bz, np_, I, J = x_l.shape
+
+        x_l_in = x_l.view(bz * np_, I, J).unsqueeze(1).expand(-1, 3, -1, -1)
+        x_l_feat = self.encoder_x_l(x_l_in)
+        x_l_feat = self.norm_l(x_l_feat)
+
+        x_g = self.encoder_x(x)
+        x_g = self.norm(x_g)
+
+        x_l_feat = x_l_feat.reshape(bz, np_, x_l_feat.shape[1]).permute(0, 2, 1)
+        x_cat = torch.cat([x_g.unsqueeze(-1), x_l_feat], dim=-1)         # (B, 6144, 7)
+        w = torch.softmax(self.cond_weight, dim=2)
+        x_weight = torch.sum(x_cat * w, dim=-1)                           # (B, 6144)
+
+        # ★ In-path bottleneck: 6144 → BN_DIM → 6144
+        x_bn  = self.bn_down(x_weight)                                    # (B, BN_DIM)
+        _state["z"] = x_bn                                                # ★ BPR 캡쳐
+        x_act = self.bn_relu(x_bn)
+        x_up  = self.bn_up(x_act)                                         # (B, 6144)
+        x_weight = (x_weight + x_up) if BPR_BN_SKIP else x_up              # pure / residual
+
+        # 나머지 원본 forward
+        y2 = self.lin1(y, t); y2 = self.unetnorm1(y2); y2 = F.softplus(y2)
+        y2 = x_weight.unsqueeze(-1).unsqueeze(-1) * y2
+        y2 = self.lin2(y2, t); y2 = self.unetnorm2(y2); y2 = F.softplus(y2)
+        y2 = self.lin3(y2, t); y2 = self.unetnorm3(y2); y2 = F.softplus(y2)
+        return self.lin4(y2)
+    MDL.ConditionalModel.forward = _cm_fwd_patched
+    print(f"[bpr-hook] xweight_bn — in-path bottleneck capture (B, {BPR_BN_DIM}), skip={BPR_BN_SKIP}")
+
+elif BPR_HOOK == "xweight":
+    # ConditionalModel 의 fused conditioning vector x_weight 캡쳐
+    # — global encoder + local encoder + cond_weight softmax fusion 결과
+    # — image-only, 라벨 stream 진입 전 단계 → timestep 무관, BPR signal 안정적
+    import model as MDL
+    _orig_cm_fwd = MDL.ConditionalModel.forward
+    def _cm_fwd_patched(self, x, y, t, x_l, attn):
+        bz, np_, I, J = x_l.shape
+
+        x_l_in = x_l.view(bz * np_, I, J).unsqueeze(1).expand(-1, 3, -1, -1)
+        x_l_feat = self.encoder_x_l(x_l_in)
+        x_l_feat = self.norm_l(x_l_feat)
+
+        x_g = self.encoder_x(x)
+        x_g = self.norm(x_g)
+
+        x_l_feat = x_l_feat.reshape(bz, np_, x_l_feat.shape[1]).permute(0, 2, 1)
+        x_cat = torch.cat([x_g.unsqueeze(-1), x_l_feat], dim=-1)         # (B, 6144, 7)
+        w = torch.softmax(self.cond_weight, dim=2)                        # (1, 6144, 7)
+        x_weight = torch.sum(x_cat * w, dim=-1)                           # (B, 6144)
+
+        # ★ xweight 캡쳐
+        _state["z"] = x_weight
+
+        # 나머지 원본 forward
+        y2 = self.lin1(y, t); y2 = self.unetnorm1(y2); y2 = F.softplus(y2)
+        y2 = x_weight.unsqueeze(-1).unsqueeze(-1) * y2
+        y2 = self.lin2(y2, t); y2 = self.unetnorm2(y2); y2 = F.softplus(y2)
+        y2 = self.lin3(y2, t); y2 = self.unetnorm3(y2); y2 = F.softplus(y2)
+        return self.lin4(y2)
+    MDL.ConditionalModel.forward = _cm_fwd_patched
+    print(f"[bpr-hook] xweight — ConditionalModel fused conditioning vector (B, 6144) capture")
+
+elif BPR_HOOK in ("enc512", "enc512_local"):
+    # ResNetEncoder 의 .g (512→6144) 직전 표현 캡쳐 — backbone trainable, timestep 무관
+    # 원본 ResNetEncoder.forward_feature: self.f → flatten → self.g
+    # 우리는 self.g 직전 (B, 512) 또는 (B*K, 512) 를 가져옴
+    import model as MDL
+    _orig_cm_fwd = MDL.ConditionalModel.forward
+    def _cm_fwd_patched(self, x, y, t, x_l, attn):
+        bz, np_, I, J = x_l.shape
+
+        # encoder_x_l: ResNet18 backbone .f → flatten → .g(512→6144)
+        x_l_in = x_l.view(bz * np_, I, J).unsqueeze(1).expand(-1, 3, -1, -1)
+        x_l_512_raw = self.encoder_x_l.f(x_l_in)
+        x_l_512 = torch.flatten(x_l_512_raw, start_dim=1)         # (B*K, 512)
+        x_l_feat = self.encoder_x_l.g(x_l_512)                    # (B*K, 6144)
+        x_l_feat = self.norm_l(x_l_feat)
+
+        # encoder_x: ResNet18 backbone .f → flatten → .g
+        x_512_raw = self.encoder_x.f(x)
+        x_512 = torch.flatten(x_512_raw, start_dim=1)             # (B, 512)
+        x_g = self.encoder_x.g(x_512)                             # (B, 6144)
+        x_g = self.norm(x_g)
+
+        # ★ 512-d hook capture
+        if BPR_HOOK == "enc512":
+            _state["z"] = x_512                                   # (B, 512)
+        else:  # enc512_local
+            if BPR_LOCAL_POOL == "parallel":
+                _state["z"] = x_l_512                             # parallel: (B*K, 512)
+            else:
+                _state["z"] = x_l_512.view(bz, np_, -1).mean(dim=1)   # (B, 512) — K=6 평균
+
+        # 나머지는 원본 forward 와 동일
+        y2 = self.lin1(y, t); y2 = self.unetnorm1(y2); y2 = F.softplus(y2)
+        x_l_feat = x_l_feat.reshape(bz, np_, x_l_feat.shape[1]).permute(0, 2, 1)
+        x_cat = torch.cat([x_g.unsqueeze(-1), x_l_feat], dim=-1)
+        w = torch.softmax(self.cond_weight, dim=2)
+        x_weight = torch.sum(x_cat * w, dim=-1)
+        y2 = x_weight.unsqueeze(-1).unsqueeze(-1) * y2
+        y2 = self.lin2(y2, t); y2 = self.unetnorm2(y2); y2 = F.softplus(y2)
+        y2 = self.lin3(y2, t); y2 = self.unetnorm3(y2); y2 = F.softplus(y2)
+        return self.lin4(y2)
+    MDL.ConditionalModel.forward = _cm_fwd_patched
+    print(f"[bpr-hook] {BPR_HOOK} — ConditionalModel encoder pre-projection 512-d capture")
+
+elif BPR_HOOK == "dual2ch":
+    # 설계 2 — dual-channel conditioning. 아키텍처는 독립 모듈 dual_pipe.py 에 있고,
+    # 여기서는 그걸 적용하고 e_cls 를 이 스크립트의 _state["z"] 로 받아 BPR 을 건다.
+    # (BPR loss/projection/optimizer 배관은 아래 'main' branch 경로를 그대로 재사용)
+    import dual_pipe
+    dual_pipe.apply(_state)   # _state["z"] = e_cls (좁은 클래스 채널, instance 경로와 분리)
+    print(f"[bpr-hook] dual2ch — dual-channel conditioning (instance x_weight BPR-free + narrow class pipe BPR-shaped)")
+
+else:
+    raise ValueError(f"BPR_HOOK={BPR_HOOK} 미지원 (attn | prelin4 | enc512 | enc512_local | xweight | xweight_bn | xweight_aux | dual_gl | dual2ch 중 택1)")
+
+# (2) CoolSystem.training_step 재정의
+#     원본 training_step 본문을 그대로 옮기되 `with torch.no_grad():` 만 조건부로 전환
+#     + 기존 BPR injection (joint/mgda/pcgrad) 그대로 유지
+import diffuser_trainer as DT
+from utils import cast_label_to_one_hot_and_prototype as _cast_oh
+
+# (2a) Stage 2 — CoolSystem.__init__ 후 baseline ckpt 로 state_dict 로드 + LR scaling
+if BPR_STAGE == 2:
+    _orig_init = DT.CoolSystem.__init__
+    def _init_stage2(self, hparams):
+        _orig_init(self, hparams)
+        # LR scaling: configure_optimizers 가 사용하는 lr 와 eta_min 의 기준점 둘 다 조정
+        if BPR_STAGE2_LR_SCALE != 1.0:
+            try:
+                self.params.optim.lr = float(self.params.optim.lr) * BPR_STAGE2_LR_SCALE
+            except Exception:
+                pass
+            self.initlr = float(self.initlr) * BPR_STAGE2_LR_SCALE
+            print(f"[stage2] LR scaled by {BPR_STAGE2_LR_SCALE} → initlr={self.initlr:.2e}")
+        # Stage1 ckpt 로드
+        if not BPR_STAGE2_CKPT:
+            raise RuntimeError("[stage2] BPR_STAGE2_CKPT not set. shell 스크립트가 자동탐색하거나 직접 지정하세요.")
+        if not os.path.exists(BPR_STAGE2_CKPT):
+            raise FileNotFoundError(f"[stage2] BPR_STAGE2_CKPT not found: {BPR_STAGE2_CKPT}")
+        # PyTorch 2.6 부터 weights_only 기본값이 True 로 바뀜 → easydict.EasyDict 같은
+        # custom 객체 거부. 자기 학습 ckpt 라 trusted 이므로 weights_only=False 로 로드.
+        try:
+            sd = torch.load(BPR_STAGE2_CKPT, map_location="cpu", weights_only=False)
+        except TypeError:
+            # 구버전 PyTorch 는 weights_only 인자 없음 — 그냥 호출
+            sd = torch.load(BPR_STAGE2_CKPT, map_location="cpu")
+        if isinstance(sd, dict) and "state_dict" in sd:
+            sd = sd["state_dict"]
+        missing, unexpected = self.load_state_dict(sd, strict=False)
+        print(f"[stage2] loaded {BPR_STAGE2_CKPT}")
+        print(f"[stage2] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
+    DT.CoolSystem.__init__ = _init_stage2
+
+# === MedViT-style 2-phase: training_step 안에서 lazy 진입 (hook 의존성 제거) ===========
+# 함수로 정의 — training_step 에서 첫 batch_idx 시점에 호출됨.
+def _enter_phase2_if_due(self):
+    """Phase 2 진입 조건 검사 + 1회 freeze + fusion_dnn 을 optimizer 에 등록."""
+    if not BPR_TWO_PHASE or _phase_state["frozen"]:
+        return
+    try:
+        total = int(self.trainer.max_epochs) if self.trainer is not None else 100
+    except Exception:
+        total = 100
+    s1 = BPR_PHASE1_EPOCHS if BPR_PHASE1_EPOCHS > 0 else max(1, total // 2)
+    if self.current_epoch < s1:
+        return
+
+    # ① freeze 적용 — 옵션 C 매핑 (MedViT 의 backbone freeze + head trainable 과 진짜 대응)
+    #   "Backbone" (Phase 2 freeze) = encoder_x, encoder_x_l, norm, norm_l, cond_weight + aux_model 전체
+    #   "Classifier head" (trainable) = ConditionalModel 의 lin1, lin2, lin3, lin4 (+ unetnorm 들)
+    #   lin1~4 는 noise prediction layers — diffusion sampling 의 핵심. inference path 와 정합.
+    n_frozen = n_trainable = 0
+    head_params = []
+    # ConditionalModel 의 최상위 attribute 중 head 에 해당하는 것만 정확히 매칭
+    # (substring 매칭은 encoder_x_l.* 같은 곳에서 오작동 위험)
+    HEAD_PREFIXES = {"lin1", "lin2", "lin3", "lin4",
+                     "unetnorm1", "unetnorm2", "unetnorm3"}
+    for name, p in self.model.named_parameters():
+        top = name.split(".", 1)[0]   # e.g. "lin1.lin.weight" → "lin1"
+        if top in HEAD_PREFIXES:
+            p.requires_grad = True
+            head_params.append(p)
+            n_trainable += p.numel()
+        else:
+            p.requires_grad = False
+            n_frozen += p.numel()
+    # aux_model 전체 freeze (DCG global/local/attention 모두 backbone 으로 취급)
+    for _, p in self.aux_model.named_parameters():
+        p.requires_grad = False
+        n_frozen += p.numel()
+
+    # ② optimizer 에 lin1-4 head 만 새 param_group 으로 등록
+    added = False
+    try:
+        opts = self.trainer.optimizers
+        lr_new = float(self.initlr) * BPR_PHASE2_LR_SCALE
+        # 기존 param_group 들의 LR 은 0 (모두 freeze 됐으므로 어차피 업데이트 X)
+        for pg in opts[0].param_groups:
+            pg["lr"] = 0.0
+        if head_params:
+            opts[0].add_param_group({"params": head_params, "lr": lr_new})
+            added = True
+        print(f"[bpr-2phase] LR for lin1-4 head = {lr_new:.2e}")
+    except Exception as _e:
+        print(f"[bpr-2phase] optimizer 갱신 실패 ({_e}) — head 업데이트 안 될 수 있음")
+
+    print(f"[bpr-2phase] === Phase 2 begin at epoch {self.current_epoch} (Option C — head fine-tune) ===")
+    print(f"[bpr-2phase] frozen={n_frozen/1e6:.2f}M (encoder_x/x_l/norm/cond_weight + aux_model) | "
+          f"trainable={n_trainable/1e6:.4f}M (lin1-4 + unetnorm)")
+    print(f"[bpr-2phase] head → optimizer: {'OK' if added else 'FAILED'}")
+    print(f"[bpr-2phase] loss = diffusion_focal_loss (원래 그대로), BPR DISABLED")
+    _phase_state["frozen"] = True
+    _phase_state["phase1_done_at"] = s1
+
+if BPR_TWO_PHASE:
+    print(f"[bpr-2phase] ENABLED — phase1_epochs={BPR_PHASE1_EPOCHS if BPR_PHASE1_EPOCHS > 0 else 'auto (max_epochs/2)'}, "
+          f"phase2_lr_scale={BPR_PHASE2_LR_SCALE}")
+
+_orig_ts = DT.CoolSystem.training_step
+def _ts_patched(self, batch, batch_idx):
+    # === 원본 training_step 본문 재정의 (no_grad 만 조건부) ===
+    # === MedViT-style Phase 2 (옵션 C): lin1-4 head trainable, BPR off, 원래 loss 그대로 ===
+    # Lazy 진입 — training_step 에 들어올 때마다 체크 (on_train_epoch_start hook 의존 제거)
+    _enter_phase2_if_due(self)
+    in_phase2 = BPR_TWO_PHASE and _phase_state["frozen"]
+
+    # Phase 2 에서도 self.model 은 forward 가 필요 (lin1-4 만 학습이라 .train() 유지)
+    self.model.train()
+    # aux_model 은 평소대로 eval (Phase 2 에서 frozen 이므로 grad 흐를 필요 없음)
+    do_unfreeze = (not in_phase2) and ((DCG_UNFREEZE != "0") and (self.current_epoch >= DCG_WARMUP))
+    self.aux_model.train() if do_unfreeze else self.aux_model.eval()
+
+    x_batch, y_batch_raw = batch
+    y_batch_oh, _ = _cast_oh(y_batch_raw, self.params)
+    y_batch_oh = y_batch_oh.cuda(); x_batch = x_batch.cuda()
+
+    if do_unfreeze:
+        y0_aux, y0_aux_global, y0_aux_local, patches, attns, attn_map = self.aux_model(x_batch)
+    else:
+        with torch.no_grad():
+            y0_aux, y0_aux_global, y0_aux_local, patches, attns, attn_map = self.aux_model(x_batch)
+
+    # === Phase 1 / Phase 2 공통 — 원래 학습 경로 ===
+    # (Phase 2 면 BPR injection 만 skip, 학습 path 자체는 동일)
+    bz, nc, H, W = attn_map.size()
+    bz, npp = attns.size()
+    y_map = y_batch_oh.unsqueeze(1).expand(-1, npp*npp, -1).reshape(bz*npp*npp, nc)
+    noise = torch.randn_like(y_map).to(self.device)
+    timesteps = torch.randint(
+        0, self.DiffSampler.scheduler.config.num_train_timesteps,
+        (bz*npp*npp,), device=self.device,
+    ).long()
+    noisy_y = self.DiffSampler.scheduler.add_noise(y_map, timesteps=timesteps, noise=noise)
+    noisy_y = noisy_y.view(bz, npp*npp, -1).permute(0, 2, 1).reshape(bz, nc, npp, npp)
+    y0_cond = self.guided_prob_map(y0_aux_global, y0_aux_local, bz, nc, npp)
+    y_fusion = torch.cat([y0_cond, noisy_y], dim=1)
+    attns2 = attns.unsqueeze(-1)
+    attns2 = (attns2 * attns2.transpose(1, 2)).unsqueeze(1)
+    noise_pred = self.model(x_batch, y_fusion, timesteps, patches, attns2)
+    noise = noise.view(bz, npp*npp, -1).permute(0, 2, 1).reshape(bz, nc, npp, npp)
+    loss = self.diffusion_focal_loss(y0_aux, y_batch_oh, noise_pred, noise)
+    # Stage 2 — diffusion loss 가중치 감소 (기본 0 = pure BPR refinement)
+    if BPR_STAGE == 2 and BPR_STAGE2_DIFF_W != 1.0:
+        loss = BPR_STAGE2_DIFF_W * loss
+    self.log("train_loss", loss, prog_bar=True)
+    if in_phase2:
+        self.log("train_phase", 2.0, prog_bar=True)
+    out = {"loss": loss}
+
+    # === BPR injection (multi-branch, warmup / timestep 게이트 포함) ===
+    # MedViT-style Phase 2: BPR 완전 비활성 (head fine-tune 중이라 표현 변경 X)
+    if in_phase2:
+        return out
+    # training-step warmup
+    if self.current_epoch < BPR_WARMUP_EPOCHS:
+        return out
+
+    # 활성 branch 결정 — dual_gl 만 2 branch, 그 외는 1 branch
+    if BPR_HOOK == "dual_gl":
+        _branch_keys = [("zg", "g"), ("zl", "l")]
+    else:
+        _branch_keys = [("z",  "main")]
+
+    try:
+        labels_full = y_batch_raw.view(-1).to(self.device)
+    except Exception:
+        return out
+
+    # (b) timestep 게이트 (이미지별 평균 timestep < BPR_T_MAX 인 샘플만)
+    _gate_mask = None
+    if BPR_T_MAX < 1.0:
+        try:
+            T_total = float(self.DiffSampler.scheduler.config.num_train_timesteps)
+            t_per_img = timesteps.view(bz, npp * npp).float().mean(dim=1)
+            t_frac = t_per_img / T_total
+            _gate_mask = (t_frac < BPR_T_MAX)
+            n_active = int(_gate_mask.sum().item())
+            self.log("bpr_n_active", float(n_active), prog_bar=False)
+            if n_active < BPR_MIN_ACTIVE:
+                return out
+        except Exception:
+            _gate_mask = None
+
+    # branch 별로 BPR loss 계산
+    _bpr_per_branch = []
+    for state_key, branch_name in _branch_keys:
+        z = _state.get(state_key)
+        if z is None:
+            continue
+        # parallel mode: z 의 batch dim = B*K. labels 를 repeat_interleave 로 확장.
+        labels_b = labels_full
+        if z.size(0) == bz:
+            # 표준 (per-image) — gate mask 적용 가능
+            if _gate_mask is not None:
+                z = z[_gate_mask]
+                labels_b = labels_full[_gate_mask]
+        elif z.size(0) % bz == 0:
+            # parallel — z.size(0) = bz * K, label 도 K 배 expand
+            K = z.size(0) // bz
+            labels_b = labels_full.repeat_interleave(K)
+            if _gate_mask is not None:
+                mask_exp = _gate_mask.repeat_interleave(K)
+                z = z[mask_exp]
+                labels_b = labels_b[mask_exp]
+        else:
+            # 예외 shape — skip
+            continue
+        if z.size(0) < 2:
+            continue
+        try:
+            head, _ = _ensure_projection(branch_name, z.size(-1), z.device)
+            head.train()
+            zp = head(z.float())
+            zp = torch.nn.functional.normalize(zp, dim=-1)
+            _update_buffer(branch_name, zp, labels_b)
+            ext_proto = _buffer_prototypes(branch_name, zp.device) if BPR_PROTO_SCOPE == "global" else None
+            bpr_b = total_bpr_loss(zp, labels_b, num_classes=NUM_CLASSES,
+                                    use_adversarial=BPR_ADV, prototype=BPR_PROTO,
+                                    external_prototypes=ext_proto)
+            _bpr_per_branch.append((branch_name, bpr_b))
+        except Exception:
+            continue
+
+    if not _bpr_per_branch:
+        return out
+
+    # branch 평균 (dual_gl 이면 2개 branch 평균)
+    bpr = sum(b for _, b in _bpr_per_branch) / len(_bpr_per_branch)
+    if len(_bpr_per_branch) > 1:
+        for n, b in _bpr_per_branch:
+            self.log(f"train_bpr_{n}", float(b.item()), prog_bar=False)
+    # 호환을 위해 단일 branch 의 labels 변수 유지 (MGDA/PCGrad 블록에서 미사용)
+    labels = labels_full
+    # === BPR_MODE 분기 ===
+    # grad target: hook 위치에 맞춰 trainable 파라미터 선택
+    #   prelin4 / enc512 / enc512_local / xweight / xweight_bn / xweight_aux / dual_gl → self.model 가 grad path
+    #   attn                                                                             → self.aux_model (DCG, unfreeze 시) 가 grad path
+    if BPR_HOOK in ("prelin4", "enc512", "enc512_local", "xweight", "xweight_bn", "xweight_aux", "dual_gl", "dual2ch"):
+        _grad_target = [p for p in self.model.parameters() if p.requires_grad]
+    else:  # attn
+        _grad_target = [p for p in self.aux_model.parameters() if p.requires_grad]
+        # DCG frozen 상태면 grad 가 빈 → fallback 으로 self.model 사용
+        if not _grad_target:
+            _grad_target = [p for p in self.model.parameters() if p.requires_grad]
+
+    if BPR_MODE == "pcgrad":
+        # PL automatic_optimization 이라 정확한 PCGrad 어려움 — cosine sim 기반 근사
+        try:
+            params = _grad_target
+            g_ce  = torch.autograd.grad(out["loss"], params, retain_graph=True, allow_unused=True)
+            g_bpr = torch.autograd.grad(BPR_LAMBDA * bpr, params, retain_graph=True, allow_unused=True)
+            g1 = torch.cat([torch.zeros_like(p).flatten() if g is None else g.flatten()
+                             for p, g in zip(params, g_ce)])
+            g2 = torch.cat([torch.zeros_like(p).flatten() if g is None else g.flatten()
+                             for p, g in zip(params, g_bpr)])
+            dot = (g1 * g2).sum()
+            cos = (dot / (g1.norm() * g2.norm() + 1e-12)).item()
+        except Exception:
+            cos = 1.0
+        if cos < 0:
+            w = max(0.0, 1.0 + cos)
+            out["loss"] = out["loss"] + w * BPR_LAMBDA * bpr
+        else:
+            out["loss"] = out["loss"] + BPR_LAMBDA * bpr
+        self.log("pcgrad_cos", float(cos), prog_bar=True)
+    elif BPR_MODE == "mgda":
+        try:
+            params = _grad_target
+            g_ce  = torch.autograd.grad(out["loss"], params, retain_graph=True,
+                                          create_graph=False, allow_unused=True)
+            g_bpr = torch.autograd.grad(BPR_LAMBDA * bpr, params, retain_graph=True,
+                                          create_graph=False, allow_unused=True)
+            g1 = torch.cat([torch.zeros_like(p).flatten() if g is None else g.flatten()
+                             for p, g in zip(params, g_ce)])
+            g2 = torch.cat([torch.zeros_like(p).flatten() if g is None else g.flatten()
+                             for p, g in zip(params, g_bpr)])
+            from mgda import mgda_two_task_alpha
+            alpha = mgda_two_task_alpha(g1, g2)
+        except Exception:
+            alpha = 1.0 - BPR_LAMBDA / (1.0 + BPR_LAMBDA)
+        out["loss"] = alpha * out["loss"] + (1.0 - alpha) * BPR_LAMBDA * bpr
+        self.log("alpha_mgda", float(alpha), prog_bar=True)
+    else:
+        out["loss"] = out["loss"] + BPR_LAMBDA * bpr
+
+    self.log("train_bpr", float(bpr.item()), prog_bar=True)
+    return out
+DT.CoolSystem.training_step = _ts_patched
+
+# (3) CoolSystem.configure_optimizers — DCG 파라미터를 main optimizer 에 등록
+_orig_cfg = DT.CoolSystem.configure_optimizers
+def _cfg_with_aux(self):
+    ret = _orig_cfg(self)
+    if DCG_UNFREEZE == "0":
+        return ret
+
+    # requires_grad 설정 (선택적 unfreeze)
+    for p in self.aux_model.parameters():
+        p.requires_grad = False
+    if DCG_UNFREEZE == "all":
+        for p in self.aux_model.parameters():
+            p.requires_grad = True
+    elif DCG_UNFREEZE == "attn":
+        for n, p in self.aux_model.named_parameters():
+            if any(k in n for k in ("attention_module", "mil_attn", "classifier_linear")):
+                p.requires_grad = True
+    elif DCG_UNFREEZE == "local":
+        for n, p in self.aux_model.named_parameters():
+            if any(k in n for k in ("local_network", "attention_module", "mil_attn", "classifier_linear")):
+                p.requires_grad = True
+    else:
+        print(f"[dcg-unfreeze] WARN: unknown DCG_UNFREEZE={DCG_UNFREEZE} — frozen 유지")
+        return ret
+
+    aux_params = [p for p in self.aux_model.parameters() if p.requires_grad]
+    if not aux_params:
+        print(f"[dcg-unfreeze] mode={DCG_UNFREEZE}  → 매칭 파라미터 0개, frozen 유지")
+        return ret
+
+    # Lightning 의 configure_optimizers 반환 shape 호환
+    if isinstance(ret, tuple) and len(ret) >= 1:
+        opts = ret[0] if isinstance(ret[0], list) else [ret[0]]
+    elif isinstance(ret, list):
+        opts = ret
+    else:
+        opts = [ret]
+
+    aux_lr = DCG_LR_SCALE * self.initlr
+    opts[0].add_param_group({"params": aux_params, "lr": aux_lr})
+    print(f"[dcg-unfreeze] mode={DCG_UNFREEZE}  n_params={sum(p.numel() for p in aux_params)}  "
+          f"lr={aux_lr:.2e}  warmup_epochs={DCG_WARMUP}")
+    return ret
+DT.CoolSystem.configure_optimizers = _cfg_with_aux
+
+def _on_after_backward_patched(self):
+    """Lightning 의 backward 가 끝난 뒤 모든 branch 의 projector optimizer step."""
+    for branch, info in _proj.items():
+        if info.get("opt") is not None:
+            info["opt"].step()
+            info["opt"].zero_grad(set_to_none=True)
+DT.CoolSystem.on_after_backward = _on_after_backward_patched
+print(f"[bpr] DiffMICv2 training_step + configure_optimizers monkey-patched "
+      f"(stage={BPR_STAGE}, hook={BPR_HOOK}, lambda={BPR_LAMBDA}, mode={BPR_MODE}, proto={BPR_PROTO}, scope={BPR_PROTO_SCOPE}, "
+      f"t_max={BPR_T_MAX}, bpr_warmup={BPR_WARMUP_EPOCHS}, "
+      f"dcg_unfreeze={DCG_UNFREEZE}, dcg_lr_scale={DCG_LR_SCALE}, dcg_warmup={DCG_WARMUP})")
+if BPR_STAGE == 2:
+    print(f"[bpr] stage2 — diff_w={BPR_STAGE2_DIFF_W}  lr_scale={BPR_STAGE2_LR_SCALE}  ckpt={BPR_STAGE2_CKPT}")
+
+# 본 trainer 의 main 실행
+DT.main()

@@ -1,0 +1,153 @@
+"""Architecture-only BPR hooks (parameter-adding) — shared by EVAL.
+
+배경
+----
+대부분의 BPR hook (attn / prelin4 / enc512 / xweight) 은 순수 forward-capture 라
+모델에 파라미터를 추가하지 않는다. 따라서 eval 은 원본 모델로 그대로 로드하면 된다.
+
+그러나 **xweight_aux / xweight_bn** 은 ConditionalModel.__init__ 에 보조 모듈
+(aux_down/aux_up 또는 bn_down/bn_up) 을 추가하고, forward 에서 그 출력을
+x_weight (conditioning vector) 에 더한다. 이 모듈들은 체크포인트에 저장되므로,
+**eval 시점에도 동일한 모듈 + 동일한 patched forward 를 재구성**해야
+학습 때 더해지던 보정이 추론에도 적용된다. 그렇지 않으면 보정이 통째로
+빠져 (train/test mismatch) 사실상 baseline 동작이 된다.
+
+이 모듈은 그 **아키텍처(=__init__ + forward) 부분만** 재현한다.
+BPR loss / prototype buffer / training_step patch 같은 학습 전용 코드는 없다.
+run_diffmicv2_bpr.py 의 해당 forward 와 **수치적으로 동일**해야 한다
+(detach 옵션은 gradient 만 끊으므로 forward 값에는 영향 없음).
+"""
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+_state = {"z": None}
+
+PARAM_ADDING_HOOKS = ("xweight_aux", "xweight_bn", "dual2ch", "ortho")
+
+
+def needs_arch_rebuild(hook: str) -> bool:
+    return hook in PARAM_ADDING_HOOKS
+
+
+def apply_arch_hook(hook=None, bn_dim=None, detach_main=None, bn_skip=None, verbose=True):
+    """ConditionalModel 에 xweight_aux / xweight_bn 아키텍처 패치를 적용한다.
+
+    반드시 CoolSystem(...) / load_from_checkpoint 로 모델을 만들기 **전에** 호출해야
+    __init__ 패치가 보조 모듈을 생성하고, 체크포인트가 strict=False 로 그 가중치를
+    채울 수 있다.
+
+    값은 모두 env 에서 읽으며 학습 때와 동일해야 한다:
+      BPR_HOOK, BPR_BN_DIM (기본 512), BPR_BN_SKIP (xweight_bn 전용), BPR_AUX_DETACH.
+    """
+    if hook is None:
+        hook = os.environ.get("BPR_HOOK", "attn")
+    if not needs_arch_rebuild(hook):
+        if verbose:
+            print(f"[bpr-arch-hook] hook={hook} — 파라미터 추가 없음, eval 재구성 불필요")
+        return False
+
+    if bn_dim is None:
+        bn_dim = int(os.environ.get("BPR_BN_DIM", "512"))
+    if detach_main is None:
+        detach_main = os.environ.get("BPR_AUX_DETACH", "0") == "1"
+    if bn_skip is None:
+        bn_skip = os.environ.get("BPR_BN_SKIP", "0") == "1"
+
+    if hook == "dual2ch":
+        import dual_pipe
+        dual_pipe.apply(state=None, verbose=verbose)
+        if verbose:
+            print("[bpr-arch-hook] dual2ch REBUILT for eval (via dual_pipe)")
+        return True
+    if hook == "ortho":
+        import ortho_pipe
+        ortho_pipe.apply(state=None, verbose=verbose)
+        if verbose:
+            print("[bpr-arch-hook] ortho REBUILT for eval (via ortho_pipe)")
+        return True
+
+    import model as MDL
+
+    if hook == "xweight_aux":
+        _orig_init = MDL.ConditionalModel.__init__
+
+        def _cm_init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            feat_dim = self.encoder_x.g.out_features  # 6144
+            self.aux_down = nn.Linear(feat_dim, bn_dim)
+            self.aux_relu = nn.ReLU(inplace=False)
+            self.aux_up = nn.Linear(bn_dim, feat_dim)
+            nn.init.zeros_(self.aux_up.weight)
+            nn.init.zeros_(self.aux_up.bias)
+        MDL.ConditionalModel.__init__ = _cm_init
+
+        def _cm_fwd(self, x, y, t, x_l, attn):
+            bz, np_, I, J = x_l.shape
+            x_l_in = x_l.view(bz * np_, I, J).unsqueeze(1).expand(-1, 3, -1, -1)
+            x_l_feat = self.encoder_x_l(x_l_in)
+            x_l_feat = self.norm_l(x_l_feat)
+            x_g = self.encoder_x(x)
+            x_g = self.norm(x_g)
+            x_l_feat = x_l_feat.reshape(bz, np_, x_l_feat.shape[1]).permute(0, 2, 1)
+            x_cat = torch.cat([x_g.unsqueeze(-1), x_l_feat], dim=-1)
+            w = torch.softmax(self.cond_weight, dim=2)
+            x_weight = torch.sum(x_cat * w, dim=-1)                 # (B, 6144)
+            src = x_weight.detach() if detach_main else x_weight
+            x_aux_mid = self.aux_down(src)                          # (B, bn_dim)
+            _state["z"] = x_aux_mid
+            x_aux_out = self.aux_up(self.aux_relu(x_aux_mid))
+            x_weight = x_weight + x_aux_out
+            y2 = self.lin1(y, t); y2 = self.unetnorm1(y2); y2 = F.softplus(y2)
+            y2 = x_weight.unsqueeze(-1).unsqueeze(-1) * y2
+            y2 = self.lin2(y2, t); y2 = self.unetnorm2(y2); y2 = F.softplus(y2)
+            y2 = self.lin3(y2, t); y2 = self.unetnorm3(y2); y2 = F.softplus(y2)
+            return self.lin4(y2)
+        MDL.ConditionalModel.forward = _cm_fwd
+
+        if verbose:
+            print(f"[bpr-arch-hook] xweight_aux REBUILT for eval "
+                  f"(bn_dim={bn_dim}, detach_main={detach_main}, zero-init residual)")
+        return True
+
+    if hook == "xweight_bn":
+        _orig_init = MDL.ConditionalModel.__init__
+
+        def _cm_init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            feat_dim = self.encoder_x.g.out_features  # 6144
+            self.bn_down = nn.Linear(feat_dim, bn_dim)
+            self.bn_relu = nn.ReLU(inplace=False)
+            self.bn_up = nn.Linear(bn_dim, feat_dim)
+        MDL.ConditionalModel.__init__ = _cm_init
+
+        def _cm_fwd(self, x, y, t, x_l, attn):
+            bz, np_, I, J = x_l.shape
+            x_l_in = x_l.view(bz * np_, I, J).unsqueeze(1).expand(-1, 3, -1, -1)
+            x_l_feat = self.encoder_x_l(x_l_in)
+            x_l_feat = self.norm_l(x_l_feat)
+            x_g = self.encoder_x(x)
+            x_g = self.norm(x_g)
+            x_l_feat = x_l_feat.reshape(bz, np_, x_l_feat.shape[1]).permute(0, 2, 1)
+            x_cat = torch.cat([x_g.unsqueeze(-1), x_l_feat], dim=-1)
+            w = torch.softmax(self.cond_weight, dim=2)
+            x_weight = torch.sum(x_cat * w, dim=-1)                 # (B, 6144)
+            x_bn = self.bn_down(x_weight)
+            _state["z"] = x_bn
+            x_act = self.bn_relu(x_bn)
+            x_up = self.bn_up(x_act)
+            x_weight = (x_weight + x_up) if bn_skip else x_up
+            y2 = self.lin1(y, t); y2 = self.unetnorm1(y2); y2 = F.softplus(y2)
+            y2 = x_weight.unsqueeze(-1).unsqueeze(-1) * y2
+            y2 = self.lin2(y2, t); y2 = self.unetnorm2(y2); y2 = F.softplus(y2)
+            y2 = self.lin3(y2, t); y2 = self.unetnorm3(y2); y2 = F.softplus(y2)
+            return self.lin4(y2)
+        MDL.ConditionalModel.forward = _cm_fwd
+
+        if verbose:
+            print(f"[bpr-arch-hook] xweight_bn REBUILT for eval "
+                  f"(bn_dim={bn_dim}, skip={bn_skip})")
+        return True
+
+    return False
